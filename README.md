@@ -1,5 +1,5 @@
 # Sentinel Console
-
+![sentinel-console](console.png)
 ![Version](https://img.shields.io/badge/version-v3.0-blue)
 ![License: MIT](https://img.shields.io/badge/License-MIT-cyan.svg)
 ![Python](https://img.shields.io/badge/python-3.13%2B-blue)
