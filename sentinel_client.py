@@ -20,7 +20,7 @@ from textual import on
 
 # ── Config ─────────────────────────────────────────────────────────────────────
 CONFIG_FILE = "/etc/sentinel/sentinel_client.conf"
-VERSION     = "v2026.06.013"
+VERSION     = "v2026.10.001"
 CHANNELS    = ["ALL", "INFRA", "AGENT", "ROOT", "SEC"]
 SORT_MODES  = ["TIME", "SEV", "HOST", "CH"]
 POLL_SEC    = 5.0
@@ -346,6 +346,24 @@ class APIClient:
     async def get_sys_info(self):
         return await self._get("/api/sys_info") or {}
 
+    # AI sezeni / audity / zdravi flotily (Sentinel v2026.09-10)
+    async def get_ai_sessions(self):
+        return await self._get("/api/ai_sessions") or []
+
+    async def get_root_audit(self):
+        return await self._get("/api/root_audit") or []
+
+    async def get_agent_health(self):
+        d = await self._get("/api/agents/health")
+        return (d or {}).get("agents", [])
+
+    async def get_incidents(self, window=2):
+        return await self._get(f"/api/incidents?window={window}") or {}
+
+    async def get_slo(self, days=7):
+        d = await self._get(f"/api/analytics/slo?days={days}")
+        return (d or {}).get("slo", [])
+
     async def close(self):
         await self._http.aclose()
 
@@ -381,6 +399,11 @@ HELP_TEXT = """\
    [yellow]l[/]  Log Viewer        [yellow]g[/] Správa agentů
    [yellow]n[/]  AI Návrhy akcí    [yellow]t[/] Predikce & Trendy
    [yellow]x[/]  AI Batch Souhrn   [yellow]z[/] AI Korelace
+
+ [bold cyan]PŘEHLEDY[/]
+   [yellow]u[/]  AI uživatelé      [yellow]R[/] Root audit
+   [yellow]h[/]  Zdraví flotily    [yellow]e[/] Incidenty
+   [yellow]b[/]  SLO / error budget
 
  [yellow]F1[/]/[yellow]?[/] Nápověda   [yellow]q[/]/[yellow]F10[/] Ukončit
 """
@@ -958,6 +981,309 @@ class PredictionsModal(ModalScreen):
         await self._load()
 
 
+
+# ── Novinky ze Sentinelu v2026.09-10 ───────────────────────────────────────────
+def _short_dt(iso):
+    """2026-10-23T15:33:19+00:00 -> 23.10. 15:33"""
+    if not iso:
+        return "-"
+    m = re.match(r"(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2})", str(iso))
+    return f"{m.group(3)}.{m.group(2)}. {m.group(4)}:{m.group(5)}" if m else str(iso)[:16]
+
+
+def _age(iso_from, iso_to=None):
+    """Delka mezi dvema ISO casy jako 3d / 4h / 12m."""
+    import datetime as _dt
+    def _p(v):
+        try:
+            return _dt.datetime.fromisoformat(str(v).replace("Z", "+00:00"))
+        except Exception:
+            return None
+    a = _p(iso_from)
+    if not a:
+        return "-"
+    b = _p(iso_to) if iso_to else _dt.datetime.now(a.tzinfo or _dt.timezone.utc)
+    if not b:
+        return "-"
+    sec = max(0, int((b - a).total_seconds()))
+    if sec < 3600:
+        return f"{sec // 60}m"
+    if sec < 86400:
+        return f"{sec // 3600}h"
+    return f"{sec // 86400}d"
+
+
+class _TableModal(ModalScreen):
+    """Spolecny zaklad tabulkovych prehledu — ramec, nacteni, reload, Esc."""
+
+    TITLE_TEXT = ""
+    COLUMNS    = ()
+
+    # Textual cte DEFAULT_CSS z TRIDY, ne z instance — jako @property by sem
+    # dorazil objekt property a parser spadne na 'has no attribute splitlines'.
+    # Barvy proto resi potomci vlastnim DEFAULT_CSS; Textual je slucuje po MRO,
+    # takze potomkovo pravidlo prebije zdejsi vychozi.
+    DEFAULT_CSS = """
+    _TableModal { align: center middle; }
+    #tm-box {
+        width: 97%; height: 88%;
+        background: #0d0d0d; border: solid #107c10; layout: vertical;
+    }
+    #tm-title {
+        height: 1; background: #0a3d0a; color: #ffffff;
+        padding: 0 1; text-style: bold;
+    }
+    #tm-table { height: 1fr; background: #000000; color: #dddddd; }
+    #tm-table > .datatable--header {
+        background: #0a3d0a; color: #4ade80; text-style: bold;
+    }
+    #tm-table > .datatable--cursor { background: #107c10; color: #ffffff; }
+    #tm-footer { height: 1; background: #1a1a1a; color: #888888; padding: 0 1; }
+    """
+
+    BINDINGS = [
+        Binding("escape", "dismiss", show=False),
+        Binding("r", "reload", "Reload"),
+    ]
+
+    def __init__(self, api):
+        super().__init__()
+        self.api = api
+
+    def compose(self):
+        with Vertical(id="tm-box"):
+            yield Static(f"[bold]{self.TITLE_TEXT}[/]  r:reload  Esc:zavřít", id="tm-title")
+            yield DataTable(id="tm-table", zebra_stripes=True)
+            yield Static("", id="tm-footer")
+
+    async def on_mount(self):
+        t = self.query_one("#tm-table", DataTable)
+        t.cursor_type = "row"
+        t.add_columns(*self.COLUMNS)
+        await self._load()
+
+    async def _load(self):
+        table  = self.query_one("#tm-table", DataTable)
+        footer = self.query_one("#tm-footer", Static)
+        footer.update("[dim]Načítám...[/]")
+        table.clear()
+        try:
+            summary = await self.fill(table)
+        except Exception as e:
+            footer.update(f"[red]Chyba: {e}[/]")
+            return
+        footer.update(summary or "[dim]r:Obnovit  Esc:Zavřít[/]")
+
+    async def fill(self, table):
+        raise NotImplementedError
+
+    async def action_reload(self):
+        await self._load()
+
+
+class AiSessionsModal(_TableModal):
+    """Kdo na strojich pousti jake AI (Sentinel v2026.10.003+)."""
+
+    DEFAULT_CSS = """
+    AiSessionsModal #tm-box { border: solid #0e7490; }
+    AiSessionsModal #tm-title { background: #083344; }
+    AiSessionsModal #tm-table > .datatable--header { background: #083344; }
+    AiSessionsModal #tm-table > .datatable--cursor { background: #0e7490; }
+    """
+    TITLE_TEXT = "AI UŽIVATELÉ — zachycená sezení"
+    COLUMNS    = ("", "Uživatel", "Nástroj", "Stroj", "Model", "Běží", "PID", "Adresář")
+
+    async def fill(self, table):
+        rows = await self.api.get_ai_sessions()
+        rows.sort(key=lambda r: (not r.get("is_active"), r.get("tool") or "", r.get("user") or ""))
+        tools = {}
+        for r in rows:
+            act = bool(r.get("is_active"))
+            tools[r.get("tool") or "?"] = tools.get(r.get("tool") or "?", 0) + (1 if act else 0)
+            table.add_row(
+                Text("●", style="green") if act else Text("○", style="grey50"),
+                r.get("user") or "?",
+                r.get("tool") or "?",
+                r.get("host") or "?",
+                (r.get("model") or "-").split("=")[-1][:22],
+                _age(r.get("started_at"), None if act else (r.get("ended_at") or r.get("last_seen"))),
+                str(r.get("pid") or "-"),
+                (r.get("cwd") or "-")[:34],
+            )
+        active = sum(1 for r in rows if r.get("is_active"))
+        top = "  ".join(f"{t}:{n}" for t, n in sorted(tools.items(), key=lambda x: -x[1]) if n)
+        return f"[dim]{active} běží / {len(rows)} celkem   {top}[/]"
+
+
+class RootAuditModal(_TableModal):
+    """Aktivni a historicke root relace."""
+
+    DEFAULT_CSS = """
+    RootAuditModal #tm-box { border: solid #a16207; }
+    RootAuditModal #tm-title { background: #422006; }
+    RootAuditModal #tm-table > .datatable--header { background: #422006; }
+    RootAuditModal #tm-table > .datatable--cursor { background: #a16207; }
+    """
+    TITLE_TEXT = "ROOT AUDIT — relace"
+    COLUMNS    = ("", "Server", "Cluster", "IP", "TTY", "Od", "Trvání")
+
+    async def fill(self, table):
+        rows = await self.api.get_root_audit()
+        for r in rows:
+            act = bool(r.get("is_active"))
+            table.add_row(
+                Text("●", style="yellow") if act else Text("○", style="grey50"),
+                r.get("server") or "?",
+                r.get("cluster") or "-",
+                r.get("ip") or "-",
+                r.get("tty") or "-",
+                _short_dt(r.get("connected_at")),
+                _age(r.get("connected_at"), None if act else r.get("disconnected_at")),
+            )
+        active = sum(1 for r in rows if r.get("is_active"))
+        return f"[dim]{active} aktivních / {len(rows)} celkem[/]"
+
+
+class FleetHealthModal(_TableModal):
+    """Zdravi vsech agentu — stav, verze, pocty alertu."""
+
+    DEFAULT_CSS = """
+    FleetHealthModal #tm-box { border: solid #107c10; }
+    FleetHealthModal #tm-title { background: #0a3d0a; }
+    FleetHealthModal #tm-table > .datatable--header { background: #0a3d0a; }
+    FleetHealthModal #tm-table > .datatable--cursor { background: #107c10; }
+    """
+    TITLE_TEXT = "ZDRAVÍ FLOTILY — agenti"
+    COLUMNS    = ("", "Host", "Verze", "OS", "24h", "7d", "Celkem", "Lag", "Naposled")
+
+    async def fill(self, table):
+        rows = await self.api.get_agent_health()
+        for a in rows:
+            online = (a.get("status") or "").upper() == "ONLINE"
+            lag = a.get("last_data_lag_ms")
+            table.add_row(
+                Text("●", style="green") if online else Text("●", style="red"),
+                a.get("hostname") or "?",
+                (a.get("agent_version") or "-")[:12],
+                (a.get("os_name") or "-")[:18],
+                str(a.get("alerts_24h") or 0),
+                str(a.get("alerts_7d") or 0),
+                str(a.get("alerts_total") or 0),
+                f"{int(lag)}ms" if isinstance(lag, (int, float)) else "-",
+                _short_dt(a.get("last_seen")),
+            )
+        online = sum(1 for a in rows if (a.get("status") or "").upper() == "ONLINE")
+        offline = len(rows) - online
+        warn = "" if not offline else f"   [red]{offline} offline[/]"
+        return f"[dim]{online} online / {len(rows)} agentů{warn}[/]"
+
+
+class IncidentsModal(ModalScreen):
+    """Aktivni issues seskupene do incidentu podle casu vzniku."""
+
+    DEFAULT_CSS = """
+    IncidentsModal { align: center middle; }
+    #in-box {
+        width: 92%; height: 86%;
+        background: #0d0d0d; border: solid #7c3aed; layout: vertical;
+    }
+    #in-title {
+        height: 1; background: #2e1065; color: #c4b5fd;
+        padding: 0 1; text-style: bold;
+    }
+    #in-scroll { height: 1fr; background: #000000; }
+    #in-body   { padding: 1 2; color: #cccccc; }
+    #in-footer { height: 1; background: #1a1a1a; color: #888888; padding: 0 1; }
+    """
+    BINDINGS = [
+        Binding("escape", "dismiss", show=False),
+        Binding("r", "reload", "Reload"),
+    ]
+
+    def __init__(self, api):
+        super().__init__()
+        self.api = api
+
+    def compose(self):
+        with Vertical(id="in-box"):
+            yield Static("[bold]INCIDENTY — seskupené alerty[/]  r:reload  Esc:zavřít", id="in-title")
+            with ScrollableContainer(id="in-scroll"):
+                yield Static("[dim]Načítám...[/]", id="in-body")
+            yield Static("", id="in-footer")
+
+    async def on_mount(self):
+        await self._load()
+
+    async def _load(self):
+        body   = self.query_one("#in-body", Static)
+        footer = self.query_one("#in-footer", Static)
+        footer.update("[dim]Načítám...[/]")
+        d = await self.api.get_incidents()
+        incidents = d.get("incidents") or []
+        if not incidents:
+            body.update("[green]Žádné seskupené incidenty.[/]\n\n"
+                        "[dim]Seskupuje se podle času vzniku — jeden výpadek,\n"
+                        "který vyrobí alerty na více strojích, je jeden incident.[/]")
+            footer.update(f"[dim]{d.get('total_issues', 0)} aktivních issues, žádné seskupení[/]")
+            return
+        sev_color = {"CRITICAL": "red", "WARNING": "yellow"}
+        out = []
+        for inc in incidents:
+            sev = str(inc.get("severity") or "-").upper()
+            col = sev_color.get(sev, "cyan")
+            out.append(
+                f"[bold {col}]{inc.get('id', '?')}[/]  [{col}]{sev}[/]  "
+                f"[white]{inc.get('issue_count', 0)} alertů[/]  "
+                f"[dim]{_short_dt(inc.get('started_at'))} → {_short_dt(inc.get('ended_at'))} "
+                f"({inc.get('span_min', 0)} min)[/]"
+            )
+            out.append(f"   [dim]stroje:[/] {', '.join(inc.get('hosts') or []) or '-'}")
+            out.append(f"   [dim]detektory:[/] {', '.join(inc.get('plugins') or []) or '-'}")
+            out.append("")
+        body.update("\n".join(out))
+        footer.update(
+            f"[dim]{len(incidents)} incidentů  |  {d.get('grouped_issues', 0)} seskupených "
+            f"a {d.get('standalone_issues', 0)} samostatných z {d.get('total_issues', 0)} issues[/]"
+        )
+
+    async def action_reload(self):
+        await self._load()
+
+
+class SloModal(_TableModal):
+    """SLO a error budget po strojich."""
+
+    DEFAULT_CSS = """
+    SloModal #tm-box { border: solid #be123c; }
+    SloModal #tm-title { background: #4c0519; }
+    SloModal #tm-table > .datatable--header { background: #4c0519; }
+    SloModal #tm-table > .datatable--cursor { background: #be123c; }
+    """
+    TITLE_TEXT = "SLO — dostupnost a error budget (7 dní)"
+    COLUMNS    = ("", "Host", "Dostupnost", "Cíl", "Výpadek", "Budget zbývá", "Využito")
+
+    async def fill(self, table):
+        rows = await self.api.get_slo(7)
+        breached = 0
+        for r in rows:
+            st = str(r.get("status") or "").lower()
+            ok = st in ("ok", "healthy", "")
+            if not ok:
+                breached += 1
+            used = r.get("budget_used_pct")
+            table.add_row(
+                Text("●", style="green") if ok else Text("●", style="red"),
+                r.get("host") or "?",
+                f"{r.get('uptime_pct', 0):.2f}%",
+                f"{r.get('target_pct', 0):.2f}%",
+                f"{r.get('downtime_min', 0):.0f} min",
+                f"{r.get('budget_remaining_min', 0):.0f} min",
+                f"{used:.0f}%" if isinstance(used, (int, float)) else "-",
+            )
+        warn = "" if not breached else f"   [red]{breached} mimo cíl[/]"
+        return f"[dim]{len(rows)} strojů{warn}[/]"
+
+
 # ── Main App ───────────────────────────────────────────────────────────────────
 class SentinelConsole(App):
     """Sentinel TUI v3.0 — HTOP style."""
@@ -1093,6 +1419,12 @@ class SentinelConsole(App):
         Binding("t",          "open_trends",  "Trendy",  show=False),
         Binding("x",          "ai_summary",   "AI Sum",  show=False),
         Binding("z",          "ai_correlate", "AI Kor",  show=False),
+        # Prehledy pribyle v Sentinelu v2026.09-10
+        Binding("u",          "open_ai_users",  "AI uživatelé", show=False),
+        Binding("R",          "open_root_audit","Root audit",   show=False),
+        Binding("h",          "open_fleet",     "Zdraví",       show=False),
+        Binding("e",          "open_incidents", "Incidenty",    show=False),
+        Binding("b",          "open_slo",       "SLO",          show=False),
     ]
 
     def __init__(self, api):
@@ -1547,6 +1879,21 @@ class SentinelConsole(App):
 
     def action_open_trends(self):
         self.push_screen(PredictionsModal(self.api))
+
+    def action_open_ai_users(self):
+        self.push_screen(AiSessionsModal(self.api))
+
+    def action_open_root_audit(self):
+        self.push_screen(RootAuditModal(self.api))
+
+    def action_open_fleet(self):
+        self.push_screen(FleetHealthModal(self.api))
+
+    def action_open_incidents(self):
+        self.push_screen(IncidentsModal(self.api))
+
+    def action_open_slo(self):
+        self.push_screen(SloModal(self.api))
 
     async def action_ai_summary(self):
         log = self.query_one("#chat-log", Log)
