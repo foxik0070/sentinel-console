@@ -1,0 +1,7 @@
+# Sentinel Console (TUI) — zavislosti klienta.
+# Rozsahy, ne presne piny: je to nastroj na stanici, ne sluzba, takze
+# drobne vyssi verze knihoven nevadi. Horni mez drzi major, po kterem
+# textual mival nekompatibilni zmeny v API widgetu.
+textual>=8.0,<9
+httpx>=0.27,<1
+rich>=13.0
